@@ -14,6 +14,24 @@
 //
 // Po štarte sa najprv overí SPI spojenie Arduino <-> MCP2515, až potom
 // sa vysiela. Ovládanie cez Serial 115200 - príkaz "h" vypíše zoznam.
+//
+// --------------------------------------------------
+// EN: 207cc fakeBSI - bringing the original display (EMF) to life on the bench
+//
+// Arduino + MCP2515 pretends to be the BSI: it sends the frames that tell
+// the display "ignition is on", so it lights up. It also listens to what
+// the display sends back (0x167, 0x0DF, 0x3F6...), so you can tell right
+// away whether it is alive - even if the screen stays dark.
+//
+// Display wiring (from the PSAVanCanBridge wiki - check which connector
+// you have before applying 12 V):
+//   12-pin (EMF-A/C):  1 = +12 V   3 = GND   9 = CAN-H   7 = CAN-L
+//    6-pin (EMF-C):    1 = +12 V   3 = GND   4 = CAN-H   6 = CAN-L
+// The 12 V supply GND must be tied to the Arduino GND.
+//
+// On start the Arduino <-> MCP2515 SPI link is tested first; nothing is
+// transmitted until it passes. Control over Serial at 115200 - command
+// "h" prints the list (all Serial texts are in Slovak).
 // ==================================================
 
 #include <SPI.h>
@@ -24,23 +42,29 @@ MCP_CAN CAN(CAN_CS);
 
 // --------------------------------------------------
 // Stav "auta" - mení sa príkazmi cez Serial
+// EN: "Car" state - changed by Serial commands
 // --------------------------------------------------
 
 bool ignition = true;
-bool lights = false;      // zapnuté svetlá = displej stmavne na "brightness"
+bool lights = false;      // zapnuté svetlá = displej stmavne na "brightness" / lights on = display dims to "brightness"
 bool economy = false;
-bool txEnabled = true;    // false = ticho na zbernici (BSI "spí")
+bool txEnabled = true;    // false = ticho na zbernici (BSI "spí") / false = silent bus (BSI "asleep")
 byte brightness = 15;     // 0..15
 int outTemp = 21;         // °C
 
 // --------------------------------------------------
 // Rámce BSI -> displej (rozloženie podľa autowp.github.io)
+// EN: BSI -> display frames (layout from autowp.github.io)
 // --------------------------------------------------
 
 // 0x036: zapaľovanie + podsvietenie
 //   B2 bit7 = economy mode
 //   B3      = jas 0-15, bit5 = svetlá zapnuté
 //   B4      = režim siete: 1 = normál, 2 = čoskoro spánok
+// EN: 0x036: ignition + backlight
+//   B2 bit7 = economy mode
+//   B3      = brightness 0-15, bit5 = lights on
+//   B4      = network mode: 1 = normal, 2 = going to sleep soon
 byte data036[8] = {
   0x0E, 0x00, 0x00, 0x0F,
   0x01, 0x00, 0x00, 0xA0
@@ -48,12 +72,15 @@ byte data036[8] = {
 
 // 0x0F6: B0 bit3 = kľúč v polohe zapaľovania, B1 = teplota vody,
 //   B2-4 = km, B5/B6 = vonkajšia teplota (T + 40) * 2
+// EN: 0x0F6: B0 bit3 = key in ignition position, B1 = coolant temperature,
+//   B2-4 = odometer, B5/B6 = outside temperature (T + 40) * 2
 byte data0F6[8] = {
   0x88, 0x7E, 0x06, 0x01,
   0xA7, 0x6D, 0x6D, 0x28
 };
 
 // 0x1A1: info hláška - tento payload = žiadna hláška
+// EN: 0x1A1: info message - this payload = no message
 byte data1A1[8] = {
   0x7F, 0xFF, 0x00, 0xFF,
   0xFF, 0xFF, 0xFF, 0xFF
@@ -61,6 +88,8 @@ byte data1A1[8] = {
 
 // 0x221: palubný počítač - okamžitá spotreba 6.5 l, dojazd 600 km
 //   B0 bit3 = stlačené tlačidlo na páčke stieračov
+// EN: 0x221: trip computer - instant consumption 6.5 l, range 600 km
+//   B0 bit3 = wiper stalk button pressed
 byte data221[7] = {
   0x00, 0x00, 0x41, 0x02,
   0x58, 0xFF, 0xFF
@@ -68,6 +97,7 @@ byte data221[7] = {
 
 // 0x2A1 / 0x261: trip 1 / trip 2
 //   B0 = priem. rýchlosť, B1-2 = km, B3-4 = priem. spotreba * 10
+// EN: B0 = average speed, B1-2 = distance in km, B3-4 = average consumption * 10
 byte data2A1[7] = {
   0x34, 0x00, 0x7B, 0x00,
   0x44, 0x00, 0x00
@@ -80,6 +110,8 @@ byte data261[7] = {
 
 // 0x3E5: tlačidlá na rádiu (MENU/OK/ESC/šípky).
 // Neposiela sa pravidelne, len na príkaz "k".
+// EN: 0x3E5: radio faceplate buttons (MENU/OK/ESC/arrows).
+// Not sent periodically, only on the "k" command.
 byte data3E5[6] = {
   0x00, 0x00, 0x00,
   0x00, 0x00, 0x00
@@ -87,6 +119,7 @@ byte data3E5[6] = {
 
 // --------------------------------------------------
 // Pravidelne vysielané rámce
+// EN: Periodically transmitted frames
 // --------------------------------------------------
 
 struct Periodic
@@ -112,6 +145,7 @@ const byte periodicCount =
 
 // --------------------------------------------------
 // Prijaté rámce - posledný payload podľa ID
+// EN: Received frames - last payload per ID
 // --------------------------------------------------
 
 #define MAX_SEEN 16
@@ -126,20 +160,21 @@ struct Seen
 Seen seen[MAX_SEEN];
 byte seenCount = 0;
 
-bool verbose = false;     // true = vypisuj každý prijatý rámec
+bool verbose = false;     // true = vypisuj každý prijatý rámec / true = print every received frame
 
 // --------------------------------------------------
 // Diagnostika zbernice
+// EN: Bus diagnostics
 // --------------------------------------------------
 
 enum
 {
   BUS_UNKNOWN,
-  BUS_NOACK,
-  BUS_ACKONLY,
-  BUS_ALIVE,
-  BUS_ERRORS,
-  BUS_SILENT
+  BUS_NOACK,      // nikto nepotvrdzuje naše rámce / nobody ACKs our frames
+  BUS_ACKONLY,    // displej potvrdzuje, ale nevysiela / display ACKs but sends nothing
+  BUS_ALIVE,      // displej vysiela platné rámce / display sends valid frames
+  BUS_ERRORS,     // rušenie alebo chyby na zbernici / noise or errors on the bus
+  BUS_SILENT      // vysielanie vypnuté príkazom "z" / TX disabled by the "z" command
 };
 
 byte busState = BUS_UNKNOWN;
@@ -153,6 +188,7 @@ unsigned long lastCheck = 0;
 byte lastRec = 0;
 
 // tlačidlá sa po chvíli samy "pustia"
+// EN: buttons "release" themselves after a moment
 bool buttonDown = false;
 bool tripDown = false;
 unsigned long buttonAt = 0;
@@ -163,6 +199,7 @@ byte lineLen = 0;
 unsigned long lastChar = 0;
 
 // posledné prečítané CANSTAT / CANCTRL a príznak, že SPI vracia nezmysly
+// EN: last CANSTAT / CANCTRL read and a flag that SPI is returning garbage
 bool spiFault = false;
 byte lastStat = 0;
 byte lastCtrl = 0;
@@ -181,6 +218,9 @@ void printHex(byte value)
 // Priamy prístup k registrom MCP2515, mimo knižnice. Knižnica sama
 // nepozná, že SPI vracia nezmysly: "Entering Configuration Mode
 // Successful!" vypíše aj vtedy a nezmysly potom vyzerajú ako prijaté rámce.
+// EN: Direct access to MCP2515 registers, bypassing the library. The library
+// cannot tell that SPI is returning garbage: it still prints "Entering
+// Configuration Mode Successful!" and the garbage then looks like received frames.
 // --------------------------------------------------
 
 byte mcpRead(byte address)
@@ -210,6 +250,8 @@ void mcpWrite(byte address, byte value)
 // --------------------------------------------------
 // V normálnom režime je CANCTRL presne 0x07 a v CANSTAT sú bity 7-5,
 // 4 a 0 nulové. Čokoľvek iné = SPI vracia nezmysly, alebo sa čip resetol.
+// EN: In normal mode CANCTRL is exactly 0x07 and CANSTAT bits 7-5, 4 and 0
+// are zero. Anything else = SPI returns garbage, or the chip has reset itself.
 // --------------------------------------------------
 
 bool spiSane()
@@ -222,6 +264,7 @@ bool spiSane()
 
 // --------------------------------------------------
 // Test SPI v troch krokoch, každý ukazuje na inú chybu zapojenia
+// EN: SPI test in three steps, each pointing at a different wiring fault
 // --------------------------------------------------
 
 bool testSPI()
@@ -236,11 +279,13 @@ bool testSPI()
   SPI.begin();
 
   // pull-up: keď MISO nikto nebudí, číta sa 0xFF namiesto náhodných hodnôt
+  // EN: pull-up: with nobody driving MISO it reads 0xFF instead of random values
   pinMode(MISO, INPUT_PULLUP);
 
   Serial.println(F("Test SPI spojenia s MCP2515:"));
 
   // 1) čip nie je vybraný (CS = HIGH), takže MISO nesmie budiť
+  // EN: 1) chip is not selected (CS = HIGH), so it must not drive MISO
   Serial.print(F("  bez CS:        "));
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
 
@@ -258,6 +303,7 @@ bool testSPI()
   Serial.println(F(" (ma byt FF)"));
 
   // 2) po resete musí byť CANSTAT = 0x80 a CANCTRL = 0x87
+  // EN: 2) after reset CANSTAT must be 0x80 and CANCTRL 0x87
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(CAN_CS, LOW);
   SPI.transfer(0xC0);
@@ -275,6 +321,7 @@ bool testSPI()
   Serial.println(F("  (ma byt 80 87)"));
 
   // 3) zápis do dát TXB0 a spätné čítanie
+  // EN: 3) write to the TXB0 data bytes and read them back
   for (byte i = 0; i < 8; i++)
     mcpWrite(0x36 + i, pattern[i]);
 
@@ -316,6 +363,8 @@ bool testSPI()
 // --------------------------------------------------
 // MCP_STDEXT = prijímať len platné rámce (MCP_ANY ukladá aj úlomky
 // rámcov s chybou). Skúša dokola, kým SPI neprejde testom.
+// EN: MCP_STDEXT = receive valid frames only (MCP_ANY also stores fragments
+// of errored frames). Retries until the SPI test passes.
 // --------------------------------------------------
 
 void connectMCP()
@@ -345,6 +394,8 @@ void connectMCP()
 
 // Bez ACK od displeja ostane rámec visieť v MCP2515 a vráti sa chyba,
 // takže návratová hodnota = "počúva na zbernici niekto?"
+// EN: Without an ACK from the display the frame stays pending in the MCP2515
+// and an error is returned, so the return value = "is anyone listening on the bus?"
 bool sendFrame(unsigned int id, byte len, byte *data)
 {
   if (CAN.sendMsgBuf(id, 0, len, data) == CAN_OK)
@@ -377,6 +428,7 @@ void printFrame(unsigned int id, byte len, byte *data)
 
 // --------------------------------------------------
 // Jednorazové rámce (príkazy) - s výpisom, či ich niekto potvrdil
+// EN: One-shot frames (commands) - prints whether anyone acknowledged them
 // --------------------------------------------------
 
 void sendAndPrint(unsigned int id, byte len, byte *data)
@@ -407,6 +459,7 @@ const __FlashStringHelper *frameName(unsigned int id)
 
 // --------------------------------------------------
 // true = rámec je nový alebo sa zmenil, oplatí sa ho vypísať
+// EN: true = the frame is new or has changed, worth printing
 // --------------------------------------------------
 
 bool rememberFrame(unsigned int id, byte len, byte *data)
@@ -423,10 +476,12 @@ bool rememberFrame(unsigned int id, byte len, byte *data)
     memcpy(seen[i].data, data, len);
 
     // 0x3F6 je čas - mení sa každú sekundu, stačí ho vidieť raz
+    // EN: 0x3F6 is the clock - it changes every second, seeing it once is enough
     return id != 0x3F6;
   }
 
   // plná tabuľka: radšej vypisovať stále, než nové ID zamlčať
+  // EN: table full: better to print every time than to hide a new ID
   if (seenCount == MAX_SEEN)
     return true;
 
@@ -446,12 +501,15 @@ void readCAN()
   byte len;
 
   // knižnica kopíruje toľko bajtov, koľko udáva DLC (až 15)
+  // EN: the library copies as many bytes as the DLC says (up to 15)
   byte buf[16];
 
   // najviac 8 rámcov naraz, aby záplava na zbernici nezastavila vysielanie
+  // EN: at most 8 frames per call, so a flood on the bus cannot stall transmission
   for (byte n = 0; n < 8 && CAN.checkReceive() == CAN_MSGAVAIL; n++)
   {
     // nezmysly z rozpadnutého SPI vyzerajú ako prijaté rámce - najprv overiť
+    // EN: garbage from a broken SPI link looks like received frames - verify first
     if (n == 0 && !spiSane())
     {
       spiFault = true;
@@ -477,6 +535,7 @@ void readCAN()
     Serial.print(frameName(id));
 
     // 0x167 B1 bit5 = displej je zhasnutý tlačidlom DARK
+    // EN: 0x167 B1 bit5 = display is blanked by the DARK button
     if (id == 0x167 && len > 1 && (buf[1] & 0x20))
       Serial.print(F(" - rezim DARK, zrus prikazom: k k"));
 
@@ -499,6 +558,7 @@ void sendPeriodic()
     sendFrame(periodic[i].id, periodic[i].len, periodic[i].data);
 
     // MCP2515 má len 2 prijímacie buffre - vyberať priebežne
+    // EN: the MCP2515 has only 2 receive buffers - drain them as we go
     readCAN();
   }
 }
@@ -596,6 +656,9 @@ void printStatus()
 // Raz za sekundu vyhodnotí stav, vypisuje len zmenu.
 // Čisté "nikto nepotvrdzuje" = TEC ostane stáť na 128..135 a REC je 0;
 // čokoľvek iné pri neúspešnom vysielaní znamená rušenie na zbernici.
+// EN: Evaluates the bus state once a second and prints only changes.
+// A clean "nobody acknowledges" = TEC settles at 128..135 and REC is 0;
+// anything else while transmission fails means disturbance on the bus.
 // --------------------------------------------------
 
 void checkBus()
@@ -633,6 +696,20 @@ void checkBus()
 }
 
 // --------------------------------------------------
+// EN: commands (the help text below is printed in Slovak)
+//   i          ignition on/off
+//   l          lights on/off (display dims)
+//   b 0-15     brightness with lights on
+//   t -40..87  outside temperature
+//   e          economy mode on/off
+//   k X        radio button: m=MENU o=OK e=ESC k=DARK u d l r=arrows
+//   p          trip computer button (wiper stalk)
+//   m 78       info message with the given code (hex), plain m = clear
+//   x ID B0..  one-shot raw frame (hex), e.g. x 3E5 40 00 00 00 00 00
+//   z          transmission on/off (silence = BSI asleep)
+//   v          print every received frame / changes only
+//   s          bus status
+// --------------------------------------------------
 
 void printHelp()
 {
@@ -654,6 +731,7 @@ void printHelp()
 // --------------------------------------------------
 // 0x3E5: B0 bit6 MENU | B2 bit6 OK, bit4 ESC, bit2 DARK
 //        B5 bit6 hore, bit4 dole, bit2 vpravo, bit0 vľavo
+// EN:    B5 bit6 up, bit4 down, bit2 right, bit0 left
 // --------------------------------------------------
 
 void pressButton(char button)
@@ -738,6 +816,8 @@ void handleCommand(char *text)
     case 'm':
       // EXPERIMENTÁLNE: marker 0xC6 a B3 sú odpozorované z jedinej
       // hlášky na aute (airbag, kód 0x78), pre iné kódy neoverené
+      // EN: EXPERIMENTAL: marker 0xC6 and B3 were observed on a single message
+      // in the car (airbag, code 0x78), not verified for other codes
       if (*arg)
       {
         data1A1[0] = 0x80;
@@ -783,6 +863,8 @@ void handleCommand(char *text)
 // --------------------------------------------------
 // Riadok končí NL/CR, alebo 50 ms pauzou (Serial Monitor
 // nastavený na "No line ending")
+// EN: A line ends with NL/CR, or with a 50 ms pause (Serial Monitor
+// set to "No line ending")
 // --------------------------------------------------
 
 void readSerial()
@@ -844,6 +926,8 @@ void loop()
 {
   // SPI vracia nezmysly alebo sa čip resetol: nič neposielať ani
   // nevypisovať, kým spojenie znova neprejde testom
+  // EN: SPI returns garbage or the chip has reset: send and print nothing
+  // until the link passes the test again
   if (spiFault)
   {
     Serial.print(F("MCP2515 neodpoveda spravne (CANSTAT="));
@@ -863,10 +947,12 @@ void loop()
   readSerial();
 
   // až po príkazoch - tie si zapisujú vlastný millis()
+  // EN: only after the commands - they store their own millis()
   unsigned long now = millis();
 
   // -----------------------------------------------
   // Pravidelné CAN správy
+  // EN: Periodic CAN messages
   // -----------------------------------------------
 
   if (txEnabled)
@@ -874,6 +960,7 @@ void loop()
 
   // -----------------------------------------------
   // Pustenie tlačidiel
+  // EN: Releasing the buttons
   // -----------------------------------------------
 
   if (buttonDown && now - buttonAt >= 200)
@@ -892,6 +979,7 @@ void loop()
 
   // -----------------------------------------------
   // Diagnostika raz za sekundu
+  // EN: Diagnostics once a second
   // -----------------------------------------------
 
   if (now - lastCheck >= 1000)
